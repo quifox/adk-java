@@ -102,14 +102,18 @@ public class McpSessionManager {
       Object connectionParams, McpTransportBuilder transportBuilder) {
     Duration initializationTimeout = null;
     Duration requestTimeout = null;
-    McpClientTransport transport = transportBuilder.build(connectionParams);
-    if (connectionParams instanceof SseServerParameters sseServerParams) {
+    Object transportBuilderParams = connectionParams;
+    if (connectionParams instanceof StdioConnectionParameters stdioConnectionParameters) {
+      transportBuilderParams = stdioConnectionParameters.serverParams().toServerParameters();
+      requestTimeout = stdioConnectionParameters.timeoutDuration();
+    } else if (connectionParams instanceof SseServerParameters sseServerParams) {
       initializationTimeout = sseServerParams.timeout();
       requestTimeout = sseServerParams.sseReadTimeout();
     } else if (connectionParams instanceof StreamableHttpServerParameters streamableParams) {
       initializationTimeout = streamableParams.timeout();
       requestTimeout = streamableParams.readTimeout();
     }
+    McpClientTransport transport = transportBuilder.build(transportBuilderParams);
     return McpClient.async(transport)
         .initializationTimeout(
             initializationTimeout == null ? Duration.ofMinutes(5) : initializationTimeout)
