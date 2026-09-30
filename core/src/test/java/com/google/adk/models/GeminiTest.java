@@ -371,6 +371,132 @@ public final class GeminiTest {
     assertThat(second.args().get()).containsExactly("b", "2");
   }
 
+  // A new named streamed call is a call boundary. Both calls may arrive in one raw response and
+  // remain open until the stream closes; each call must retain its own arguments, ID, and
+  // signature. Buffered text keeps the existing text-before-call flush order at the boundary.
+  @Test
+  public void processRawResponses_newNamedStreamedCall_flushesPriorCall() {
+    Part firstCall =
+        Part.builder()
+            .functionCall(
+                FunctionCall.builder()
+                    .name("getWeather")
+                    .partialArgs(
+                        PartialArg.builder().jsonPath("$.city").stringValue("Krakow").build())
+                    .willContinue(true)
+                    .build())
+            .thoughtSignature("krakow-signature".getBytes(UTF_8))
+            .build();
+    Part secondCall =
+        Part.builder()
+            .functionCall(
+                FunctionCall.builder()
+                    .name("getWeatherForecast")
+                    .partialArgs(
+                        ImmutableList.of(
+                            PartialArg.builder().jsonPath("$.city").stringValue("Warsaw").build(),
+                            PartialArg.builder().jsonPath("$.unit").stringValue("C").build()))
+                    .willContinue(true)
+                    .build())
+            .thoughtSignature("warsaw-signature".getBytes(UTF_8))
+            .build();
+    Part textBetweenCalls =
+        Part.builder()
+            .text("Checking forecast. ")
+            .thoughtSignature("text-sig".getBytes(UTF_8))
+            .build();
+    GenerateContentResponse streamedCallsWithStop =
+        toResponse(
+            Candidate.builder()
+                .content(Content.builder().parts(firstCall, textBetweenCalls, secondCall).build())
+                .finishReason(new FinishReason(FinishReason.Known.STOP))
+                .build());
+
+    ImmutableList<LlmResponse> responses =
+        ImmutableList.copyOf(
+            Gemini.processRawResponses(Flowable.just(streamedCallsWithStop)).blockingIterable());
+
+    assertThat(responses).hasSize(2);
+    String firstPartialId = functionCallId(responses.get(0), 0);
+    String secondPartialId = functionCallId(responses.get(0), 2);
+    assertThat(firstPartialId).startsWith("adk-");
+    assertThat(secondPartialId).startsWith("adk-");
+    assertThat(firstPartialId).isNotEqualTo(secondPartialId);
+
+    LlmResponse finalResponse = Iterables.getLast(responses);
+    assertThat(finalResponse.content().get().parts().get()).hasSize(3);
+    FunctionCall first = finalResponse.content().get().parts().get().get(1).functionCall().get();
+    FunctionCall second = finalResponse.content().get().parts().get().get(2).functionCall().get();
+    assertThat(finalResponse.content().get().parts().get().get(0).thoughtSignature())
+        .hasValue("text-sig".getBytes(UTF_8));
+    assertThat(finalResponse.content().get().parts().get().get(0).text())
+        .hasValue("Checking forecast. ");
+    assertThat(first.name()).hasValue("getWeather");
+    assertThat(first.args().get()).containsExactly("city", "Krakow");
+    assertThat(first.id()).hasValue(firstPartialId);
+    assertThat(finalResponse.content().get().parts().get().get(1).thoughtSignature())
+        .hasValue("krakow-signature".getBytes(UTF_8));
+    assertThat(second.name()).hasValue("getWeatherForecast");
+    assertThat(second.args().get()).containsExactly("city", "Warsaw", "unit", "C");
+    assertThat(second.id()).hasValue(secondPartialId);
+    assertThat(finalResponse.content().get().parts().get().get(2).thoughtSignature())
+        .hasValue("warsaw-signature".getBytes(UTF_8));
+  }
+
+  // Repeating the active call's name on a continuation is still the same call, so its argument
+  // chunks are combined and the first chunk's signature remains attached to the result.
+  @Test
+  public void processRawResponses_repeatedNameContinuesSameStreamedCall() {
+    GenerateContentResponse firstChunk =
+        toResponse(
+            Part.builder()
+                .functionCall(
+                    FunctionCall.builder()
+                        .name("getWeather")
+                        .id("weather-call-id")
+                        .partialArgs(
+                            PartialArg.builder().jsonPath("$.city").stringValue("Krak").build())
+                        .willContinue(true)
+                        .build())
+                .thoughtSignature("weather-signature".getBytes(UTF_8))
+                .build());
+    GenerateContentResponse finalChunk =
+        toResponse(
+            Candidate.builder()
+                .content(
+                    Content.builder()
+                        .parts(
+                            Part.builder()
+                                .functionCall(
+                                    FunctionCall.builder()
+                                        .name("getWeather")
+                                        .partialArgs(
+                                            PartialArg.builder()
+                                                .jsonPath("$.city")
+                                                .stringValue("ow")
+                                                .build())
+                                        .willContinue(false)
+                                        .build())
+                                .thoughtSignature("later-signature".getBytes(UTF_8))
+                                .build())
+                        .build())
+                .finishReason(new FinishReason(FinishReason.Known.STOP))
+                .build());
+
+    ImmutableList<LlmResponse> responses =
+        ImmutableList.copyOf(
+            Gemini.processRawResponses(Flowable.just(firstChunk, finalChunk)).blockingIterable());
+
+    LlmResponse finalResponse = Iterables.getLast(responses);
+    assertThat(finalResponse.content().get().parts().get()).hasSize(1);
+    FunctionCall call = finalResponse.content().get().parts().get().get(0).functionCall().get();
+    assertThat(call.name()).hasValue("getWeather");
+    assertThat(call.args().get()).containsExactly("city", "Krakow");
+    assertThat(call.id()).hasValue("weather-call-id");
+    assertThat(finalResponse.content().get().parts().get().get(0).thoughtSignature())
+        .hasValue("weather-signature".getBytes(UTF_8));
+  }
+
   // The last partialArgs chunk keeps willContinue=true; completion arrives on a separate empty
   // willContinue=false marker, then trailing text follows. The marker must flush the call so it
   // precedes the text. Without handling the marker, close() flushes the call after the text,

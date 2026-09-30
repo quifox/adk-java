@@ -498,6 +498,12 @@ public class Gemini extends BaseLlm {
               || fc.willContinue().orElse(false)
               || (currentFcName != null && !hasName);
       if (streamedPart) {
+        // A different nonempty name starts a new streamed call. Flush the prior call before
+        // capturing metadata from this part so its signature, arguments, and ID stay together.
+        if (hasName && currentFcName != null && !currentFcName.equals(fc.name().get())) {
+          flushTextBufferToSequence();
+          flushFunctionCallToSequence();
+        }
         // Capture the thought signature from the first chunk that carries one.
         if (currentThoughtSignature == null
             && part.thoughtSignature().map(sig -> sig.length > 0).orElse(false)) {
