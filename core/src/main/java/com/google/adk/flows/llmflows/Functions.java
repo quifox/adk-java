@@ -169,7 +169,8 @@ public final class Functions {
                 return Maybe.empty();
               }
               Optional<Event> maybeMergedEvent =
-                  Functions.mergeParallelFunctionResponseEvents(events);
+                  Functions.mergeParallelFunctionResponseEvents(
+                      events, invocationContext.session().state());
               if (maybeMergedEvent.isEmpty()) {
                 return Maybe.empty();
               }
@@ -233,7 +234,9 @@ public final class Functions {
               if (events.isEmpty()) {
                 return Maybe.empty();
               }
-              return Maybe.fromOptional(Functions.mergeParallelFunctionResponseEvents(events));
+              return Maybe.fromOptional(
+                  Functions.mergeParallelFunctionResponseEvents(
+                      events, invocationContext.session().state()));
             });
   }
 
@@ -585,7 +588,7 @@ public final class Functions {
   }
 
   private static Optional<Event> mergeParallelFunctionResponseEvents(
-      List<Event> functionResponseEvents) {
+      List<Event> functionResponseEvents, Map<String, Object> sessionState) {
     if (functionResponseEvents.isEmpty()) {
       return Optional.empty();
     }
@@ -614,9 +617,46 @@ public final class Functions {
             .author(baseEvent.author())
             .branch(baseEvent.branch().orElse(null))
             .content(Content.builder().role(Role.USER).parts(mergedParts).build())
-            .actions(mergedActionsBuilder.build())
+            .actions(
+                applyLatestStateWrites(
+                    mergedActionsBuilder.build(), functionResponseEvents, sessionState))
             .timestamp(baseEvent.timestamp())
             .build());
+  }
+
+  /** Preserves shared container writes without changing response order or direct-delta merging. */
+  private static EventActions applyLatestStateWrites(
+      EventActions mergedActions,
+      List<Event> functionResponseEvents,
+      Map<String, Object> sessionState) {
+    Map<String, Object> latestWrites = new HashMap<>();
+    for (String key : mergedActions.stateDelta().keySet()) {
+      Object latest = sessionState.get(key);
+      if (!(latest instanceof List<?>) && !(latest instanceof Map<?, ?>)) {
+        continue;
+      }
+      int writers = 0;
+      boolean containsLatestWrite = false;
+      for (Event event : functionResponseEvents) {
+        Map<String, Object> delta = event.actions().stateDelta();
+        if (delta.containsKey(key)) {
+          writers++;
+          // State.put stores the same object in shared state and in the tool's delta. Equality
+          // alone could mistake an unrelated session value for one of these writes.
+          containsLatestWrite |= delta.get(key) == latest;
+        }
+      }
+      if (writers > 1 && containsLatestWrite) {
+        latestWrites.put(key, latest);
+      }
+    }
+    if (latestWrites.isEmpty()) {
+      return mergedActions;
+    }
+    // Deep-merge maps so independent keys survive; list snapshots take their latest value.
+    return mergedActions.toBuilder()
+        .merge(EventActions.builder().stateDelta(latestWrites).build())
+        .build();
   }
 
   private static Maybe<Map<String, Object>> maybeInvokeBeforeToolCall(
